@@ -1,0 +1,21 @@
+# 编译产出
+build/
+install/
+log/
+
+# PX4 软链接 (每台机器路径不同)
+PX4-Autopilot
+
+# VS Code (每台机器生成不同的 Python 路径)
+.vscode/settings.json
+.vscode/browse.vc.db
+
+# Claude Code (每台机器独立)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.vscode/c_cpp_properties.json
