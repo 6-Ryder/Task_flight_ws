@@ -2,6 +2,19 @@
 
 > PX4 + ROS2 + Gazebo  —  micro-XRCE-DDS 直连架构
 
+[![GitHub](https://img.shields.io/badge/GitHub-6--Ryder/Task__flight__ws-blue?logo=github)](https://github.com/6-Ryder/Task_flight_ws)
+
+## 快速开始
+
+```bash
+git clone https://github.com/6-Ryder/Task_flight_ws.git ~/Task_flight_ws
+cd ~/Task_flight_ws
+./setup_project.sh                          # 一键初始化 (自动修复所有路径+编译)
+./src/px4_control_dds/scripts/start_mission_dds.sh   # 启动仿真
+```
+
+> 前提: 已安装 ROS2 (Humble/Jazzy)、Gazebo Harmonic、PX4-Autopilot、MicroXRCEAgent。详见 [依赖与环境](#6-依赖与环境)。
+
 ---
 
 ## 目录
