@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PX4 + ROS2 + Gazebo — 四旋翼无人机圆筒侦察任务控制器 (micro-XRCE-DDS 版)
+PX4 + ROS2 + Gazebo — 四旋翼无人机网格全覆盖侦察任务控制器 (micro-XRCE-DDS 版)
 ======================================================================
 
 ═══════════════════════════════════════════════════════════════════════════
@@ -172,15 +172,22 @@ PX4 + ROS2 + Gazebo — 四旋翼无人机圆筒侦察任务控制器 (micro-XRC
         航点定义必须使用 (north, east, down) 顺序, 否则无人机飞错方向.
 
 ═══════════════════════════════════════════════════════════════════════════
-                    任 务 流 程
+                    任 务 流 程 (全覆盖版)
 ═══════════════════════════════════════════════════════════════════════════
 
-  H 标识处起飞 (5m) → 投放区中心 → 识别 2 个较小圆筒
-  (降高至 2m, 悬停 5s, 回升至 5m) → 侦察区中心
-  → 依次飞过 5 个圆筒 (5m) → 返回 H 精准降落
+  H 标识处起飞 (5m) → 飞向区域一 (投放区) 网格起点
+  → 弓字形网格遍历区域一每一个位置 (降高至 low_altitude)
+  → 飞向区域二 (侦察区) 网格起点
+  → 弓字形网格遍历区域二每一个位置 (takeoff_height)
+  → 返回 H 精准降落
 
-  投放区 (x:40~45):  3 个圆筒 (15cm/20cm/25cm), 只访问前 2 个
-  侦察区 (x:65~70):  5 个 20cm 圆筒, 5m 高度穿越不悬停
+  区域一 (投放区, Gazebo x:40~45, y:0~8):
+    低空弓字形全覆盖 (可配置高度, 默认 2m)
+  区域二 (侦察区, Gazebo x:65~70, y:0~8):
+    巡航高度弓字形全覆盖 (可配置高度, 默认 5m)
+
+  网格间距可配置 (默认 1m). 弓字形 (lawnmower) 路径确保无人机
+  依次遍历区域内所有网格点, 实现全覆盖侦察, 不依赖具体圆筒位置.
 """
 
 import math
@@ -222,7 +229,7 @@ from px4_msgs.msg import (
 # auto() 自动分配数值, 状态转移通过 NEXT_STATE 映射定义.
 # ==========================================================================
 class MissionState(Enum):
-    """19 状态任务状态机"""
+    """全覆盖网格侦察任务状态机"""
 
     # --- 初始化阶段 ---
     INIT = auto()               # 0: 等待里程计数据稳定 (≥50条)
@@ -232,26 +239,19 @@ class MissionState(Enum):
     # --- 解锁阶段 ---
     ARM = auto()                # 3: 切换 OFFBOARD + 解锁
 
-    # --- 投放区 (圆筒识别与悬停) ---
-    TAKEOFF = auto()            # 4: H 点起飞至巡航高度 5m
-    TRANSIT_DROP = auto()       # 5: 飞向投放区中心 (32.5m 东)
-    HOVER_C1 = auto()           # 6: 筒1 (15cm) 降高至 2m 悬停 5s
-    ASCEND_C1 = auto()          # 7: 筒1 上方回升至 5m
-    HOVER_C2 = auto()           # 8: 筒2 (20cm) 降高至 2m 悬停 5s
-    ASCEND_C2 = auto()          # 9: 筒2 上方回升至 5m
+    # --- 区域一 (投放区) 弓字形全覆盖 ---
+    TAKEOFF = auto()            # 4: H 点起飞至巡航高度
+    TRANSIT_AREA1 = auto()      # 5: 飞向区域一网格起点
+    SWEEP_AREA1 = auto()        # 6: 弓字形遍历区域一所有网格点
 
-    # --- 侦察区 (5 筒依次穿越) ---
-    TRANSIT_RECON = auto()      # 10: 飞向侦察区中心 (57.5m 东)
-    RECON_C1 = auto()           # 11: 侦察筒1 穿越
-    RECON_C2 = auto()           # 12: 侦察筒2 穿越
-    RECON_C3 = auto()           # 13: 侦察筒3 穿越
-    RECON_C4 = auto()           # 14: 侦察筒4 穿越
-    RECON_C5 = auto()           # 15: 侦察筒5 穿越
+    # --- 区域二 (侦察区) 弓字形全覆盖 ---
+    TRANSIT_AREA2 = auto()      # 7: 飞向区域二网格起点
+    SWEEP_AREA2 = auto()        # 8: 弓字形遍历区域二所有网格点
 
     # --- 返航与着陆 ---
-    RETURN = auto()             # 16: 返回 H 位置 (5m)
-    LAND = auto()               # 17: 垂直下降 → 停止 Offboard → 上锁
-    COMPLETE = auto()           # 18: 任务完成
+    RETURN = auto()             # 9: 返回 H 位置 (5m)
+    LAND = auto()               # 10: 垂直下降 → 停止 Offboard → 上锁
+    COMPLETE = auto()           # 11: 任务完成
 
 
 # ==========================================================================
@@ -259,68 +259,25 @@ class MissionState(Enum):
 # ==========================================================================
 class MissionController(Node):
     """
-    micro-XRCE-DDS 圆筒侦察任务控制器.
+    micro-XRCE-DDS 全覆盖网格侦察任务控制器.
 
     通过 DDS 直连 PX4 (不经过 MAVROS), 以 20Hz 控制循环执行完整无人机任务:
-    起飞 → 投放区圆筒识别悬停 → 侦察区穿越 → 返航降落.
+    起飞 → 区域一弓字形全覆盖 → 区域二弓字形全覆盖 → 返航降落.
+
+    弓字形 (lawnmower) 路径: 沿场地宽边 (north) 来回飞行,
+    每完成一条 strip 后向东步进一个网格间距, 确保无死角覆盖.
     """
 
     # ======================================================================
-    # 航点列表 — PX4 本地 NED 坐标系
-    #
-    # 坐标系: position[0]=North(Gazebo+y), position[1]=East(Gazebo+x),
-    #          position[2]=Down(-Gazebo+z)
-    # 原点 = H 起飞点 Gazebo(10,4,0):
-    #   NED_x = world_y - 4
-    #   NED_y = world_x - 10
-    #   NED_z = -world_z
-    #
-    # 投放区 (Gazebo x:40~45): 3 个圆筒, 只访问 2 个较小的
-    # 侦察区 (Gazebo x:65~70): 5 个 20cm 圆筒, 全部穿越
-    # ======================================================================
-    WAYPOINTS = {
-        MissionState.TAKEOFF:       (0.0,   0.0,  -5.0),   # H 点起飞 5m
-        MissionState.TRANSIT_DROP:  (0.0,  32.5,  -5.0),   # 投放区中心 (w:42.5,4)
-        MissionState.HOVER_C1:      (-1.0, 31.5,  -2.0),   # 筒1 15cm (w:41.5,3.0)
-        MissionState.ASCEND_C1:     (-1.0, 31.5,  -5.0),   # 筒1 回升 5m
-        MissionState.HOVER_C2:      (1.5,  33.0,  -2.0),   # 筒2 20cm (w:43.0,5.5)
-        MissionState.ASCEND_C2:     (1.5,  33.0,  -5.0),   # 筒2 回升 5m
-        MissionState.TRANSIT_RECON: (0.0,  57.5,  -5.0),   # 侦察区中心 (w:67.5,4)
-        MissionState.RECON_C1:      (-2.0, 56.0,  -5.0),   # 侦察筒1 (w:66.0,2.0)
-        MissionState.RECON_C2:      (1.5,  57.5,  -5.0),   # 侦察筒2 (w:67.5,5.5)
-        MissionState.RECON_C3:      (3.0,  58.5,  -5.0),   # 侦察筒3 (w:68.5,7.0)
-        MissionState.RECON_C4:      (-0.5, 56.5,  -5.0),   # 侦察筒4 (w:66.5,3.5)
-        MissionState.RECON_C5:      (-2.5, 59.0,  -5.0),   # 侦察筒5 (w:69.0,1.5)
-        MissionState.RETURN:        (0.0,   0.0,  -5.0),   # 返回 H 5m
-    }
-
-    # 投放区圆筒悬停时长 (s)
-    HOVER_DURATION = {
-        MissionState.HOVER_C1: 5.0,
-        MissionState.HOVER_C2: 5.0,
-    }
-
-    # 圆筒标签 (用于日志)
-    CYL_LABELS = {
-        MissionState.HOVER_C1: ('1', '15cm'),
-        MissionState.HOVER_C2: ('2', '20cm'),
-    }
-
     # 状态转移映射 — 定义每个航点完成后跳转到哪个状态
+    # ======================================================================
     NEXT_STATE = {
-        MissionState.TAKEOFF:       MissionState.TRANSIT_DROP,
-        MissionState.TRANSIT_DROP:  MissionState.HOVER_C1,
-        MissionState.HOVER_C1:      MissionState.ASCEND_C1,
-        MissionState.ASCEND_C1:     MissionState.HOVER_C2,
-        MissionState.HOVER_C2:      MissionState.ASCEND_C2,
-        MissionState.ASCEND_C2:     MissionState.TRANSIT_RECON,
-        MissionState.TRANSIT_RECON: MissionState.RECON_C1,
-        MissionState.RECON_C1:      MissionState.RECON_C2,
-        MissionState.RECON_C2:      MissionState.RECON_C3,
-        MissionState.RECON_C3:      MissionState.RECON_C4,
-        MissionState.RECON_C4:      MissionState.RECON_C5,
-        MissionState.RECON_C5:      MissionState.RETURN,
-        MissionState.RETURN:        MissionState.LAND,
+        MissionState.TAKEOFF:        MissionState.TRANSIT_AREA1,
+        MissionState.TRANSIT_AREA1:  MissionState.SWEEP_AREA1,
+        MissionState.SWEEP_AREA1:    MissionState.TRANSIT_AREA2,
+        MissionState.TRANSIT_AREA2:  MissionState.SWEEP_AREA2,
+        MissionState.SWEEP_AREA2:    MissionState.RETURN,
+        MissionState.RETURN:         MissionState.LAND,
     }
 
     # ======================================================================
@@ -333,14 +290,43 @@ class MissionController(Node):
         # ROS2 参数 — 可通过 YAML 文件 (config/mission_params.yaml) 或
         # 命令行 (--ros-args -p param:=value) 覆盖默认值
         # ------------------------------------------------------------------
-        self.declare_parameter('takeoff_height', 5.0)         # 巡航高度 (m)
+        self.declare_parameter('takeoff_height', 5.0)         # 巡航高度 (m, NED 负值)
         self.declare_parameter('waypoint_tolerance', 0.5)     # 航点到达容差 (m)
         self.declare_parameter('takeoff_tolerance', 0.3)      # 起飞到达容差 (m)
-        self.declare_parameter('hover_duration', 5.0)         # 投放区悬停时长 (s)
+        self.declare_parameter('hover_duration', 5.0)         # (保留, 网格模式不使用悬停)
         self.declare_parameter('control_frequency', 20.0)     # 控制频率 (Hz)
         self.declare_parameter('max_error_count', 5)          # 最大容错次数
         self.declare_parameter('waypoint_timeout', 120.0)     # 单航点超时 (s)
         self.declare_parameter('land_altitude', 0.15)         # 着陆确认高度 (m)
+
+        # --- 网格全覆盖参数 ---
+        # 区域一 (投放区): Gazebo x:40~45, y:0~8
+        #   NED: north ∈ [-4.0, 4.0] (Gazebo y - 4)
+        #        east  ∈ [30.0, 35.0] (Gazebo x - 10)
+        self.declare_parameter('area1_north_min', -4.0)
+        self.declare_parameter('area1_north_max', 4.0)
+        self.declare_parameter('area1_east_min', 30.0)
+        self.declare_parameter('area1_east_max', 35.0)
+        self.declare_parameter('area1_altitude', 2.0)          # 区域一飞行高度 (m, NED 负值)
+
+        # 区域二 (侦察区): Gazebo x:65~70, y:0~8
+        #   NED: north ∈ [-4.0, 4.0] (Gazebo y - 4)
+        #        east  ∈ [55.0, 60.0] (Gazebo x - 10)
+        self.declare_parameter('area2_north_min', -4.0)
+        self.declare_parameter('area2_north_max', 4.0)
+        self.declare_parameter('area2_east_min', 55.0)
+        self.declare_parameter('area2_east_max', 60.0)
+        self.declare_parameter('area2_altitude', 5.0)          # 区域二飞行高度 (m, NED 负值)
+
+        self.declare_parameter('grid_spacing', 1.0)            # 网格间距 (m)
+        self.declare_parameter('sweep_speed', 0.8)           # 区域内部遍历速度 (m/s)
+        self.declare_parameter('transit_speed', 2.0)         # 区域之间中转速度 (m/s)
+        self.declare_parameter('return_speed', 3.0)          # 返航速度 (m/s)
+        self.declare_parameter('max_acceleration', 0.2)      # 最大加速度 (m/s²)
+        self.declare_parameter('sweep_passes', 2)            # 每区域折返次数
+        self.declare_parameter('sweep_margin_north', 1.0)   # 长边界内缩 (m)
+        self.declare_parameter('sweep_margin_east', 0.5)    # 段边界内缩 (m)
+        self.declare_parameter('long_boundary_inset', 1.0)  # 首个长边界额外内缩 (m)
 
         self.takeoff_height = self.get_parameter('takeoff_height').value
         self.waypoint_tolerance = self.get_parameter('waypoint_tolerance').value
@@ -350,6 +336,62 @@ class MissionController(Node):
         self.max_error_count = self.get_parameter('max_error_count').value
         self.waypoint_timeout = self.get_parameter('waypoint_timeout').value
         self.land_altitude = self.get_parameter('land_altitude').value
+
+        # 网格参数
+        area1_n_min = self.get_parameter('area1_north_min').value
+        area1_n_max = self.get_parameter('area1_north_max').value
+        area1_e_min = self.get_parameter('area1_east_min').value
+        area1_e_max = self.get_parameter('area1_east_max').value
+        self._area1_altitude = self.get_parameter('area1_altitude').value
+
+        area2_n_min = self.get_parameter('area2_north_min').value
+        area2_n_max = self.get_parameter('area2_north_max').value
+        area2_e_min = self.get_parameter('area2_east_min').value
+        area2_e_max = self.get_parameter('area2_east_max').value
+        self._area2_altitude = self.get_parameter('area2_altitude').value
+
+        self._grid_spacing = self.get_parameter('grid_spacing').value
+        self._sweep_speed = self.get_parameter('sweep_speed').value
+        self._transit_speed = self.get_parameter('transit_speed').value
+        self._return_speed = self.get_parameter('return_speed').value
+        self._max_acceleration = self.get_parameter('max_acceleration').value
+        self._sweep_passes = self.get_parameter('sweep_passes').value
+        self._sweep_margin_north = self.get_parameter('sweep_margin_north').value
+        self._sweep_margin_east = self.get_parameter('sweep_margin_east').value
+        self._long_boundary_inset = self.get_parameter('long_boundary_inset').value
+
+        # 当前期望巡航速度 (由各状态处理函数设置)
+        self._cruise_speed = self._transit_speed
+
+        # --- 生成弓字形全覆盖网格航点 ---
+        # 长边界 (north) 各内缩 sweep_margin_north, 段边界 (east) 各内缩 sweep_margin_east
+        self._area1_grid = self._generate_grid_waypoints(
+            area1_e_min + self._sweep_margin_east,
+            area1_e_max - self._sweep_margin_east,
+            area1_n_min + self._sweep_margin_north,
+            area1_n_max - self._sweep_margin_north,
+            self._area1_altitude, self._grid_spacing, self._sweep_passes)
+        self._area2_grid = self._generate_grid_waypoints(
+            area2_e_min + self._sweep_margin_east,
+            area2_e_max - self._sweep_margin_east,
+            area2_n_min + self._sweep_margin_north,
+            area2_n_max - self._sweep_margin_north,
+            self._area2_altitude, self._grid_spacing, self._sweep_passes)
+
+        # --- 首个长边界额外内缩 ---
+        # 将每个区域网格的第一个航点从长边界向内再偏移 long_boundary_inset,
+        # 避免无人机在抵达区域时贴着边界飞行
+        if self._long_boundary_inset > 0:
+            for grid in (self._area1_grid, self._area2_grid):
+                if grid:
+                    n, e, d = grid[0]
+                    # 第一条 strip 从 min_north → max_north (向北),
+                    # 因此首个航点在 min_north 一侧, 向内偏移
+                    grid[0] = (n + self._long_boundary_inset, e, d)
+
+        # 关键航点 (NED 坐标: north, east, down)
+        self._takeoff_wp = (0.0, 0.0, -self.takeoff_height)
+        self._return_wp = (0.0, 0.0, -self.takeoff_height)
 
         # ------------------------------------------------------------------
         # QoS 配置
@@ -495,11 +537,22 @@ class MissionController(Node):
 
         # setpoint 目标 (被 _heartbeat 以 10Hz 发布到 PX4)
         self._target = [0.0, 0.0, 0.0]        # NED 目标位置
-        self._yaw = math.pi / 2                  # 目标偏航角 (rad) — π/2=朝东(Gazebo +x), 与航点飞行方向一致
+        self._yaw = math.pi / 2                 # 目标偏航角: π/2 = 朝东 (沿场地长边方向)
 
         # 着陆标志: True 时 _heartbeat 停止发送 OffboardControlMode.position,
         # PX4 检测到失去位置控制 → 自动退出 Offboard → 可以安全上锁
         self._stop_offboard = False
+
+        # 网格遍历内部状态
+        self._sweep_index = 0                  # 当前网格航点索引
+
+        # --- setpoint 斜坡控制 ---
+        # _target:      最终目标航点 (NED 坐标)
+        # _ramped_target: 逐步向 _target 移动的中间 setpoint,
+        #                 以 _cruise_speed 速率逼近, 实现精确速度控制
+        # 心跳线程发布 _ramped_target 而非 _target,
+        # PX4 位置控制器追踪缓慢移动的 setpoint → 实际速度 = _cruise_speed
+        self._ramped_target = [0.0, 0.0, 0.0]  # 初始化在地面
 
         # ------------------------------------------------------------------
         # 定时器
@@ -513,13 +566,90 @@ class MissionController(Node):
         self.create_timer(1.0, self._registration_timer)
 
         self.get_logger().info('=' * 60)
-        self.get_logger().info('Mission Controller (micro-XRCE-DDS) v2 启动')
+        self.get_logger().info('Mission Controller (Grid Coverage v4) 启动')
         self.get_logger().info(f'  巡航高度: {self.takeoff_height}m  '
-                               f'悬停: {self.hover_duration}s')
-        self.get_logger().info('  任务: 投放区2筒(降高2m) + 侦察区5筒(5m穿越)')
+                               f'区域一高度: {self._area1_altitude}m  '
+                               f'区域二高度: {self._area2_altitude}m')
+        self.get_logger().info(f'  速度: 遍历={self._sweep_speed} m/s  '
+                               f'中转={self._transit_speed} m/s  '
+                               f'返航={self._return_speed} m/s  '
+                               f'最大加速度={self._max_acceleration} m/s²')
+        self.get_logger().info(f'  网格间距: {self._grid_spacing}m  '
+                               f'每区域折返次数: {self._sweep_passes}')
+        self.get_logger().info(f'  边界内缩: north={self._sweep_margin_north}m  '
+                               f'east={self._sweep_margin_east}m  '
+                               f'首条长边界额外内缩={self._long_boundary_inset}m')
+        self.get_logger().info(f'  区域一航点数: {len(self._area1_grid)}  '
+                               f'区域二航点数: {len(self._area2_grid)}')
+        self.get_logger().info('  路径: 起飞 → 区域一弓字形全覆盖 → '
+                               '区域二弓字形全覆盖 → 返航降落')
         self.get_logger().info('  通信: micro-XRCE-DDS (Agent UDP :8888)')
         self.get_logger().info('  等待 PX4 odometry 数据...')
         self.get_logger().info('=' * 60)
+
+    # ======================================================================
+    # 网格航点生成 — 弓字形 (Lawnmower) 全覆盖路径规划
+    #
+    # 在给定的矩形区域内生成弓字形覆盖路径:
+    #   1. 从 (min_north, min_east) 角开始
+    #   2. 沿 north 方向飞到 max_north
+    #   3. 向东步进一个 grid_spacing
+    #   4. 沿 north 反方向飞回 min_north
+    #   5. 重复 step 3-4, 直到 east 超出 max_east
+    #
+    # 这种路径确保无人机以最小的重复路径覆盖整个矩形区域.
+    # ======================================================================
+    def _generate_grid_waypoints(self, min_e, max_e, min_n, max_n,
+                                  altitude, spacing, max_strips=None):
+        """
+        生成弓字形 (lawnmower) 全覆盖路径航点列表.
+
+        Args:
+            min_e, max_e: NED east 范围 (场地长边方向)
+            min_n, max_n: NED north 范围 (场地宽边方向)
+            altitude: 飞行高度 (NED z, 负值=向上)
+            spacing: 网格间距 (m), 即两条相邻 strip 之间的 east 距离
+            max_strips: 最大 strip 数量, None 表示覆盖全部区域
+
+        Returns:
+            [(north, east, down), ...] 航点列表, 按飞行顺序排列
+        """
+        waypoints = []
+
+        # 收集所有 east 条带位置
+        e_positions = []
+        e = min_e
+        while e <= max_e + 1e-6:
+            e_positions.append(e)
+            e += spacing
+
+        # 限制折返次数 (strip 数量) — 均匀分布以覆盖整个区域宽度
+        if max_strips is not None and 1 <= max_strips < len(e_positions):
+            if max_strips == 1:
+                # 单条 strip: 放在区域中线
+                e_positions = [(min_e + max_e) / 2.0]
+            else:
+                # 多条 strip: 等间距分布, 确保首尾覆盖区域边界
+                e_positions = []
+                for i in range(max_strips):
+                    e_positions.append(
+                        min_e + i * (max_e - min_e) / (max_strips - 1))
+
+        if not e_positions:
+            return waypoints
+
+        # 弓字形: 偶数条带 north 递增, 奇数条带 north 递减
+        for i, e in enumerate(e_positions):
+            if i % 2 == 0:
+                # 从 min_north → max_north (向北飞行)
+                waypoints.append((float(min_n), float(e), float(-altitude)))
+                waypoints.append((float(max_n), float(e), float(-altitude)))
+            else:
+                # 从 max_north → min_north (向南飞行)
+                waypoints.append((float(max_n), float(e), float(-altitude)))
+                waypoints.append((float(min_n), float(e), float(-altitude)))
+
+        return waypoints
 
     # ======================================================================
     # DDS 回调函数 — 接收 PX4 → Agent → DDS → ROS2 的数据
@@ -733,18 +863,88 @@ class MissionController(Node):
         """
         self._target = [float(x), float(y), float(z)]
 
+    def _update_ramped_target(self, dt: float) -> None:
+        """
+        以 _cruise_speed 速率将 _ramped_target 向 _target 逼近.
+
+        核心速度控制机制:
+          不直接给 PX4 发送远距离位置目标 (PX4 会用内部高速 MPC 参数追踪),
+          而是每控制周期将中间目标 _ramped_target 向 _target 移动一小步.
+          PX4 追踪这个缓慢移动的 setpoint, 实际飞行速度 ≈ _cruise_speed.
+
+          近目标时自动减速: 距离 < 2m 时按比例降低逼近速率.
+
+        Args:
+            dt: 控制周期 (s), 20Hz → 0.05s
+        """
+        dx = self._target[0] - self._ramped_target[0]
+        dy = self._target[1] - self._ramped_target[1]
+        dz = self._target[2] - self._ramped_target[2]
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        if dist < 1e-6:
+            return  # 已到达目标
+
+        # 方向单位矢量
+        nx, ny, nz = dx / dist, dy / dist, dz / dist
+
+        # 近目标时平滑减速
+        approach_dist = 2.0
+        if dist > approach_dist:
+            speed = self._cruise_speed
+        else:
+            speed = self._cruise_speed * (dist / approach_dist)
+            speed = max(speed, 0.1)
+
+        step = speed * dt
+        if step >= dist:
+            # 一步之内即可到达
+            self._ramped_target[0] = self._target[0]
+            self._ramped_target[1] = self._target[1]
+            self._ramped_target[2] = self._target[2]
+        else:
+            self._ramped_target[0] += nx * step
+            self._ramped_target[1] += ny * step
+            self._ramped_target[2] += nz * step
+
     def _transition(self, new: MissionState) -> None:
         """
         状态机切换.
 
         记录旧状态、新状态、进入时间, 重置重试计数器.
         状态转移日志通过 [STATE] 前缀输出, 便于追踪任务进度.
+
+        进入 SWEEP 状态时重置网格索引.
+        根据新状态自动设置巡航速度:
+          - SWEEP_AREA1/2 → sweep_speed (区域内部低速遍历)
+          - RETURN → return_speed (返航速度)
+          - 其余飞行状态 → transit_speed (区域之间中转)
+
+        重置 _ramped_target 到当前位置, 避免 setpoint 从上一阶段的
+        旧目标跳跃到新目标 (PX4 会以最大速度追踪跳跃 setpoint).
         """
         old = self._state
         self._state = new
         self._state_enter_time = self._now()
         self._arm_attempts = 0
-        self.get_logger().info(f'[STATE] {old.name} → {new.name}')
+
+        # 根据新状态设置巡航速度
+        if new == MissionState.RETURN:
+            self._cruise_speed = self._return_speed
+        elif new in (MissionState.SWEEP_AREA1, MissionState.SWEEP_AREA2):
+            self._cruise_speed = self._sweep_speed
+        else:
+            self._cruise_speed = self._transit_speed
+
+        # 重置斜坡目标到无人机当前位置 (平滑过渡)
+        self._ramped_target = [float(self._pos[0]), float(self._pos[1]),
+                               float(self._pos[2])]
+
+        # 进入弓字形遍历状态时重置航点索引
+        if new in (MissionState.SWEEP_AREA1, MissionState.SWEEP_AREA2):
+            self._sweep_index = 0
+        self.get_logger().info(f'[STATE] {old.name} → {new.name} '
+                               f'(cruise={self._cruise_speed} m/s)')
 
     # ======================================================================
     # VehicleCommand 发送 — ROS2 → DDS → Agent → XRCE → PX4
@@ -914,10 +1114,14 @@ class MissionController(Node):
         self._offboard_pub.publish(ocm)
 
         # --- TrajectorySetpoint ---
+        # 发布斜坡位置 (_ramped_target) 而非最终目标 (_target):
+        #   _ramped_target 以 _cruise_speed 速率逐步逼近 _target,
+        #   PX4 追踪缓慢移动的 setpoint → 实际速度 = _cruise_speed
         tsp = TrajectorySetpoint()
         tsp.timestamp = self._now_us()
-        tsp.position = [float(self._target[0]), float(self._target[1]),
-                        float(self._target[2])]
+        tsp.position = [float(self._ramped_target[0]),
+                        float(self._ramped_target[1]),
+                        float(self._ramped_target[2])]
         # NaN = 不控制该维度 (PX4 内部忽略 NaN 值)
         tsp.velocity = [float('nan')] * 3
         tsp.acceleration = [float('nan')] * 3
@@ -939,8 +1143,10 @@ class MissionController(Node):
         """
         20Hz 主状态机.
 
-        每个 tick 执行当前状态的处理函数. 状态转移由各处理函数
-        调用 _transition() 触发, 下一个 tick 自动执行新状态.
+        每个 tick :
+          1. 更新斜坡 setpoint (_ramped_target → _target)
+          2. 根据当前状态执行对应处理函数
+          3. 处理函数更新 _target (最终航点), 心跳线程发布 _ramped_target
         """
         self._setpoint_counter += 1
         self._diag_counter += 1
@@ -948,6 +1154,11 @@ class MissionController(Node):
         # 等待至少 10 条里程计消息 (确保位置数据已开始流入)
         if self._pos_count < 10:
             return
+
+        # 斜坡 setpoint: 以 _cruise_speed 速率向 _target 逼近
+        # 必须在状态机之前调用, 确保每个 tick 都更新中间目标
+        dt = 1.0 / self.control_frequency
+        self._update_ramped_target(dt)
 
         # 状态机分发: match/case 确保所有状态都被处理
         match self._state:
@@ -961,28 +1172,18 @@ class MissionController(Node):
                 self._do_arm()
             case MissionState.TAKEOFF:
                 self._do_takeoff()
-            case MissionState.TRANSIT_DROP:
-                self._do_transit()
-            case MissionState.HOVER_C1:
-                self._do_hover()
-            case MissionState.ASCEND_C1:
-                self._do_transit()
-            case MissionState.HOVER_C2:
-                self._do_hover()
-            case MissionState.ASCEND_C2:
-                self._do_transit()
-            case MissionState.TRANSIT_RECON:
-                self._do_transit()
-            case MissionState.RECON_C1:
-                self._do_transit()
-            case MissionState.RECON_C2:
-                self._do_transit()
-            case MissionState.RECON_C3:
-                self._do_transit()
-            case MissionState.RECON_C4:
-                self._do_transit()
-            case MissionState.RECON_C5:
-                self._do_transit()
+            case MissionState.TRANSIT_AREA1:
+                self._do_transit_to_grid(self._area1_grid,
+                                          MissionState.SWEEP_AREA1, '区域一')
+            case MissionState.SWEEP_AREA1:
+                self._do_sweep(self._area1_grid, MissionState.TRANSIT_AREA2,
+                               '区域一')
+            case MissionState.TRANSIT_AREA2:
+                self._do_transit_to_grid(self._area2_grid,
+                                          MissionState.SWEEP_AREA2, '区域二')
+            case MissionState.SWEEP_AREA2:
+                self._do_sweep(self._area2_grid, MissionState.RETURN,
+                               '区域二')
             case MissionState.RETURN:
                 self._do_return()
             case MissionState.LAND:
@@ -1112,7 +1313,7 @@ class MissionController(Node):
 
         # 第 3 步: 解锁成功
         if self._armed:
-            self.get_logger().info('解锁成功! 开始航点任务...')
+            self.get_logger().info('解锁成功! 开始全覆盖航点任务...')
             self._transition(MissionState.TAKEOFF)
 
         # 超时保护: 120s 后放弃
@@ -1124,12 +1325,12 @@ class MissionController(Node):
 
     def _do_takeoff(self):
         """
-        Phase 4: TAKEOFF — H 点起飞至巡航高度 5m.
+        Phase 4: TAKEOFF — H 点起飞至巡航高度.
 
-        从 H 位置 (0, 0) 垂直上升到 -5.0m (NED z=down, 负值=向上).
+        从 H 位置 (0, 0) 垂直上升到巡航高度.
         使用 takeoff_tolerance (0.3m) 作为到达判断.
         """
-        tx, ty, tz = self.WAYPOINTS[MissionState.TAKEOFF]
+        tx, ty, tz = self._takeoff_wp
         self._set_target(tx, ty, tz)
 
         if self._diag_counter >= 100:
@@ -1141,103 +1342,114 @@ class MissionController(Node):
 
         if self._reached(tx, ty, tz, self.takeoff_tolerance):
             self.get_logger().info(
-                f'到达 {self.takeoff_height}m, 飞向投放区中心...')
-            self._transition(MissionState.TRANSIT_DROP)
+                f'到达 {self.takeoff_height}m, 飞向区域一网格起点...')
+            self._transition(MissionState.TRANSIT_AREA1)
 
-    def _do_transit(self):
+    def _do_transit_to_grid(self, grid, next_state, area_label):
         """
-        通用航点穿越 — 到达当前航点后自动前进到 NEXT_STATE 定义的下一状态.
+        飞向网格区域起点.
 
-        用于所有非悬停航点: TRANSIT_DROP, ASCEND_C1, ASCEND_C2,
-        TRANSIT_RECON, RECON_C1~C5.
+        飞到指定区域网格的第一个航点 (起始角).
+        到达后自动切换到对应的弓字形遍历状态.
 
-        setpoint 设为当前状态对应的 WAYPOINTS 坐标.
-        PX4 位置控制器自动规划速度曲线飞向目标.
-        到达 (距离 < waypoint_tolerance) 后自动转移.
-
-        超时保护: waypoint_timeout (120s) 后跳过当前航点继续.
-        连续超时达到 max_error_count (5 次) 后强制降落.
+        Args:
+            grid: 目标区域的网格航点列表
+            next_state: 到达后切换到的状态 (应为 SWEEP_AREA1 或 SWEEP_AREA2)
+            area_label: 区域标签 (用于日志)
         """
-        tx, ty, tz = self.WAYPOINTS.get(self._state, (0.0, 0.0, 0.0))
+        tx, ty, tz = grid[0]
         self._set_target(tx, ty, tz)
 
         if self._diag_counter >= 100:
             self._diag_counter = 0
             self.get_logger().info(
-                f'[TRANSIT] {self._state.name} '
-                f'→ ({tx:.1f},{ty:.1f},{tz:.1f}) '
-                f'dist={self._dist(tx,ty,tz):.2f}m')
+                f'[TRANSIT→{area_label}] → ({tx:.1f},{ty:.1f},{tz:.1f}) '
+                f'dist={self._dist(tx,ty,tz):.2f}m '
+                f'航点数={len(grid)}')
 
         if self._reached(tx, ty, tz):
-            next_state = self.NEXT_STATE.get(self._state)
-            if next_state:
-                self.get_logger().info(
-                    f'{self._state.name} 到达 → {next_state.name}')
-                self._transition(next_state)
+            self.get_logger().info(
+                f'到达{area_label}网格起点 (h={-tz:.1f}m), '
+                f'开始弓字形遍历 ({len(grid)} 航点)...')
+            self._transition(next_state)
 
-        # 超时: 跳过当前航点
+        # 超时保护
         if self._elapsed_in_state() > self.waypoint_timeout:
             self.get_logger().error(
-                f'航点 {self._state.name} 超时 '
-                f'({self.waypoint_timeout}s)! dist='
-                f'{self._dist(tx,ty,tz):.2f}m')
+                f'飞向{area_label}起点超时 ({self.waypoint_timeout}s)!')
             self._error_count += 1
             if self._error_count > self.max_error_count:
                 self.get_logger().error('错误次数过多, 中止任务!')
                 self._transition(MissionState.LAND)
             else:
-                next_state = self.NEXT_STATE.get(self._state)
-                if next_state:
-                    self.get_logger().warn(
-                        f'跳过 {self._state.name} → {next_state.name}')
-                    self._transition(next_state)
+                self._transition(next_state)
 
-    def _do_hover(self):
+    def _do_sweep(self, grid, next_state, area_label):
         """
-        投放区圆筒降高悬停 — 到达后在圆筒正上方悬停指定时长.
+        弓字形网格遍历 — 依次飞过网格中的每一个航点.
 
-        用于 HOVER_C1 (筒1, 15cm) 和 HOVER_C2 (筒2, 20cm).
-        悬停时长: HOVER_DURATION 中定义 (默认 5s).
-        悬停高度: WAYPOINTS 中定义 (z=-2.0, 即离地 2m).
-        悬停完成后自动回升 (NEXT_STATE 指向 ASCEND_C1/C2).
+        这是全覆盖任务的核心: 按弓字形顺序依次访问预先生成的网格航点.
+        每到达一个航点自动切换到下一个, 直到遍历完整个区域.
+
+        PX4 位置控制器自动规划航点间的速度曲线, 无需显式悬停.
+        弓字形路径确保相邻航点间距离 = grid_spacing (沿 east 方向步进)
+        或 = north_range (沿 north 方向飞完整条 strip).
+
+        Args:
+            grid: 网格航点列表 [(north, east, down), ...]
+            next_state: 遍历完成后切换到的状态
+            area_label: 区域标签 (用于日志)
         """
-        tx, ty, tz = self.WAYPOINTS.get(self._state, (0.0, 0.0, 0.0))
+        total = len(grid)
+
+        # 所有航点已遍历完成
+        if self._sweep_index >= total:
+            self.get_logger().info(
+                f'{area_label}弓字形遍历完成! ({total} 航点)')
+            self._transition(next_state)
+            return
+
+        tx, ty, tz = grid[self._sweep_index]
         self._set_target(tx, ty, tz)
-
-        elapsed = self._elapsed_in_state()
-        duration = self.HOVER_DURATION.get(self._state, self.hover_duration)
-        cyl_num, cyl_diam = self.CYL_LABELS.get(self._state, ('?', '?'))
 
         if self._diag_counter >= 100:
             self._diag_counter = 0
             self.get_logger().info(
-                f'[HOVER] 投放筒{cyl_num} ({cyl_diam}) '
-                f'elapsed={elapsed:.0f}s / {duration:.0f}s '
+                f'[SWEEP {area_label}] {self._sweep_index+1}/{total} '
+                f'→ ({tx:.1f},{ty:.1f},{tz:.1f}) '
                 f'dist={self._dist(tx,ty,tz):.2f}m '
                 f'z={self._pos[2]:.2f}m')
 
-        # 到达航点 + 悬停时间到 → 前进 (回升)
-        if elapsed >= duration and self._reached(tx, ty, tz):
+        # 到达当前航点 → 前进到下一个
+        if self._reached(tx, ty, tz):
             self.get_logger().info(
-                f'投放筒 {cyl_num} ({cyl_diam}) 悬停完成 ({duration}s) → 回升!')
-            next_state = self.NEXT_STATE.get(self._state)
-            if next_state:
-                self._transition(next_state)
+                f'{area_label} 航点 {self._sweep_index+1}/{total} 到达 '
+                f'({tx:.1f},{ty:.1f},{tz:.1f})')
+            self._sweep_index += 1
+            # 检查是否所有航点都已访问 (在下次 tick 处理, 避免立即切换)
 
-        if elapsed > self.waypoint_timeout:
-            self.get_logger().error(f'悬停 {self._state.name} 超时!')
-            next_state = self.NEXT_STATE.get(self._state)
-            if next_state:
+        # 超时保护: 按航点数量缩放
+        sweep_timeout = max(self.waypoint_timeout, total * 30.0)
+        if self._elapsed_in_state() > sweep_timeout:
+            self.get_logger().error(
+                f'{area_label}遍历超时 ({sweep_timeout:.0f}s)! '
+                f'已完成 {self._sweep_index}/{total}')
+            self._error_count += 1
+            if self._error_count > self.max_error_count:
+                self.get_logger().error('错误次数过多, 中止任务!')
+                self._transition(MissionState.LAND)
+            else:
+                self.get_logger().warn(f'跳过剩余航点 → {next_state.name}')
                 self._transition(next_state)
 
     def _do_return(self):
         """
-        Phase 16: RETURN — 返回 H 起飞点 (0, 0, -5.0).
+        Phase RETURN — 返回 H 起飞点.
 
-        从侦察区飞回 H 位置, 保持 5m 高度.
+        从侦察区飞回 H 位置, 保持巡航高度.
         到达后自动切入 LAND 状态.
         """
-        tx, ty, tz = self.WAYPOINTS[MissionState.RETURN]
+        tx, ty, tz = self._return_wp
         self._set_target(tx, ty, tz)
 
         if self._diag_counter >= 100:
@@ -1246,12 +1458,12 @@ class MissionController(Node):
                 f'[RETURN] dist={self._dist(tx,ty,tz):.2f}m')
 
         if self._reached(tx, ty, tz):
-            self.get_logger().info('已返回 H (5m), 开始降落...')
+            self.get_logger().info('已返回 H, 开始降落...')
             self._transition(MissionState.LAND)
 
     def _do_land(self):
         """
-        Phase 17: LAND — 降落至 H 点并上锁.
+        Phase LAND — 降落至 H 点并上锁.
 
         策略:
           1. setpoint 锁定 H 点 (0, 0), z=0 (地面), 无人机在 Offboard 下下降

@@ -17,6 +17,6 @@ setup(
     description='Mission controller via micro-XRCE-DDS',
     license='MIT',
     entry_points={'console_scripts': [
-        'mission_control_dds_node = px4_control_dds.mission_control_node:main',
+        'mission_control_dds_node = px4_control_dds.mission_control_node_v2:main',
     ]},
 )
